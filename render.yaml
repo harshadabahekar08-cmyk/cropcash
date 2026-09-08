@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: cropcash-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: ACCESS_TOKEN
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: DATA_GOV_IN_API_KEY
+        sync: false
+      - key: GRAPH_API_VERSION
+        value: v21.0

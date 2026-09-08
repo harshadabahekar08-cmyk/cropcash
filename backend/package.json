@@ -1,0 +1,19 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/mandiPriceService.test.js && node tests/mandiDecision.test.js && node tests/diseaseDetector.test.js && node tests/fertilizerAdvisory.test.js && node tests/openAgriNet.test.js && node tests/weatherAdvisory.test.js && node tests/pdkvKnowledgeBase.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
