@@ -155,10 +155,12 @@ function formatCropAdvisoryResponse({ cropData, topic, lang = "mr" }) {
  * Handles incoming crop cultivation queries
  * @param {string} text - User query
  * @param {'en'|'hi'|'mr'|'hinglish'} lang - Detected language
+ * @param {object} [contextOverrides] - Optional context overrides from session memory
  * @returns {Promise<string>}
  */
-async function getCropAdvisoryResponse(text, lang = "mr") {
-  const { crop } = extractMandiEntities(text);
+async function getCropAdvisoryResponse(text, lang = "mr", contextOverrides = {}) {
+  const directEntities = extractMandiEntities(text);
+  const crop = directEntities.crop || contextOverrides?.crop || null;
   const topic = detectCultivationTopic(text);
 
   let cropData = null;

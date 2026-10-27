@@ -423,10 +423,14 @@ function formatFertilizerResponse({ crop, stage, symptom, isExactDoseRequested, 
  * @param {string} text - Farmer's input text
  * @param {'en'|'hi'|'mr'|'hinglish'} lang - Detected language
  * @param {Function} [fetchFn=fetch] - Injected fetcher for testing
+ * @param {object} [contextOverrides] - Optional context overrides from session memory
  * @returns {Promise<string>}
  */
-async function getFertilizerAdvisoryResponse(text, lang = "en", fetchFn = fetch) {
+async function getFertilizerAdvisoryResponse(text, lang = "en", fetchFn = fetch, contextOverrides = {}) {
   const entities = extractFertilizerEntities(text);
+  if (!entities.crop && contextOverrides?.crop) {
+    entities.crop = contextOverrides.crop;
+  }
 
   let oanResult = null;
   if (entities.crop && !entities.symptom) {

@@ -18,5 +18,7 @@ services:
         sync: false
       - key: DATA_GOV_IN_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: GRAPH_API_VERSION
         value: v21.0

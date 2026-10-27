@@ -465,6 +465,13 @@ async function fetchOfficialMandiPrices({ commodity, district, market, state, li
 
     if (!response.ok) {
       console.error(`Data.gov.in API error: HTTP ${response.status} ${response.statusText}`);
+      if (response.status === 429) {
+        // Cache empty result for 60 seconds to prevent burst stalls during active rate-limits
+        MANDI_API_CACHE.set(cacheKey, {
+          timestamp: Date.now() - (CACHE_TTL_MS - 60000), // expires in 60s
+          data: []
+        });
+      }
       return [];
     }
 
@@ -706,12 +713,16 @@ Aap batao kitna ${cropLabel} bechna hai aur aap kis gaon se ho? Main transport c
  * @param {string} text - Farmer's input text
  * @param {'en' | 'hi' | 'mr' | 'hinglish'} lang - Detected language
  * @param {Function} [fetchFn] - Optional mock fetcher for testing
+ * @param {object} [contextOverrides] - Optional context overrides from session memory
  * @returns {Promise<string>}
  */
-async function getMandiPriceResponse(text, lang, fetchFn = fetchOfficialMandiPrices) {
-  const { crop, district } = extractMandiEntities(text);
+async function getMandiPriceResponse(text, lang, fetchFn = fetchOfficialMandiPrices, contextOverrides = {}) {
+  const extracted = extractMandiEntities(text);
+  const crop = extracted.crop || contextOverrides?.crop || null;
+  const district = extracted.district || contextOverrides?.district || null;
+
   console.log(`[MandiPriceService] Entry | Text: "${text}" | Lang: ${lang}`);
-  console.log(`[MandiPriceService] Extracted Entities: Crop=${crop?.standardName || "NONE"} | District=${district || "NONE"}`);
+  console.log(`[MandiPriceService] Resolved Entities: Crop=${crop?.standardName || "NONE"} | District=${district || "NONE"}`);
 
   // Case 1: Both crop and district identified
   if (crop && district) {

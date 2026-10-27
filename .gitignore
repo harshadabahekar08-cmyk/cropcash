@@ -16,3 +16,6 @@ npm-debug.log*
 .system_generated/
 scratch/
 .DS_Store
+
+# Private directories
+backend/Getwellsoon/

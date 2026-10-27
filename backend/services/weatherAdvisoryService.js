@@ -237,10 +237,12 @@ function formatWeatherResponse({ location, weatherResult, lang = "en" }) {
  * @param {string} text - Farmer's input text
  * @param {'en'|'hi'|'mr'|'hinglish'} lang - Detected language
  * @param {Function} [fetchFn=fetch] - Injected fetcher for testing
+ * @param {object} [contextOverrides] - Optional context overrides from session memory
  * @returns {Promise<string>}
  */
-async function getWeatherAdvisoryResponse(text, lang = "en", fetchFn = fetch) {
-  const location = extractWeatherLocation(text);
+async function getWeatherAdvisoryResponse(text, lang = "en", fetchFn = fetch, contextOverrides = {}) {
+  const directLocation = extractWeatherLocation(text);
+  const location = directLocation || contextOverrides?.location || null;
 
   let weatherResult = null;
   if (location) {

@@ -2,16 +2,25 @@
  * CropCash Response Handler
  * Processes incoming WhatsApp message payloads (Text, Audio, Image)
  * and generates language-aware, safe, and context-specific responses.
+ * Integrated with ConversationStateService for multi-turn conversational memory.
  */
 
 const { detectLanguage } = require("./languageDetector");
 const { validateAndSanitizeResponse } = require("./safetyValidator");
-const { getMandiPriceResponse } = require("./mandiPriceService");
+const { getMandiPriceResponse, extractMandiEntities } = require("./mandiPriceService");
 const { getMandiDecisionResponse, isTransportDecisionIntent } = require("./mandiDecisionService");
 const { processCropImageMessage } = require("./diseaseDetectorService");
 const { getFertilizerAdvisoryResponse } = require("./fertilizerAdvisoryService");
 const { getWeatherAdvisoryResponse } = require("./weatherAdvisoryService");
 const { getCropAdvisoryResponse } = require("./cropAdvisoryService");
+const { getSchemeResponse, identifySchemeTopic } = require("./schemeService");
+const {
+  resolveContextualEntities,
+  getFollowUpResponse,
+  resetSession,
+  isAffirmation,
+  isResetRequest
+} = require("./conversationStateService");
 
 // Agricultural Intent Keywords (Categorized)
 const INTENT_KEYWORDS = {
@@ -26,12 +35,16 @@ const INTENT_KEYWORDS = {
     "भाव वाढेल का", "भाव वाढतील का", "दर वाढतील का", "तेजी", "मंदी", "भाव बढ़ेगा क्या", "तेजी आएगी क्या"
   ],
   scheme: [
-    "scheme", "yojana", "loan", "kcc", "subsidy", "bima", "insurance", "karj", "anudan",
-    "pm kisan", "pm-kisan", "namo shetkari", "fasal bima", "pmfby",
-    "योजना", "सब्सिडी", "ऋण", "कर्ज", "अनुदान", "विमा", "बीमा", "पीएम किसान"
+    "government scheme", "govt scheme", "scheme for farmer", "farmer scheme", "farmer yojana",
+    "sarkari yojana", "kisan yojana", "kisan subsidy", "farmer subsidy", "kisan ke liye scheme",
+    "kisan ke liye subsidy", "scheme", "schemes", "yojana", "yojna", "loan", "kcc", "subsidy", "subsidies",
+    "anudan", "bima", "insurance", "karj", "rin", "pm kisan", "pm-kisan", "pmkisan", "namo shetkari",
+    "fasal bima", "pmfby", "kisan samman nidhi", "samman nidhi", "mahadbt", "maha dbt", "maha-dbt", "dbt portal",
+    "योजना", "सब्सिडी", "ऋण", "कर्ज", "अनुदान", "विमा", "बीमा", "पीएम किसान", "महाडीबीटी", "महा डीबीटी",
+    "नमो शेतकरी", "शेतकरी योजना", "सरकारी योजना", "किसान योजना", "सन्मान निधी", "सम्मान निधि"
   ],
   price: [
-    "price", "rate", "mandi", "bhav", "daam", "market", "cost", "bajarbhav",
+    "price", "prices", "rate", "rates", "mandi", "bhav", "daam", "market", "cost", "bajarbhav",
     "भाव", "दाम", "मंडी", "बाजारभाव", "बाजार", "दर", "रेट", "किंमत"
   ],
   disease: [
@@ -63,23 +76,29 @@ function escapeRegex(str) {
 }
 
 /**
- * Categorizes farmer query text into agricultural intent
+ * Categorizes farmer query text into agricultural intent, factoring in session context
  * @param {string} text 
+ * @param {object} [context=null] Optional contextual entity resolution object
  * @returns {string} Intent key
  */
-function detectIntent(text) {
+function detectIntent(text, context = null) {
   if (!text || typeof text !== "string") {
     return "greeting";
   }
 
   const clean = text.trim().toLowerCase();
 
-  // 1. Check Transport & Net-Return Decision intent first
-  if (isTransportDecisionIntent(text)) {
+  // 1. Check Reset / Start intent
+  if (isResetRequest(text) || context?.isReset) {
+    return "greeting";
+  }
+
+  // 2. Check Transport & Net-Return Decision intent
+  if (isTransportDecisionIntent(text) || context?.isStandaloneQuantity || context?.isRecommendationOnly) {
     return "transport_decision";
   }
 
-  // 2. Check specific agricultural domains in priority order: fertilizer -> trend -> scheme -> price -> disease -> weather -> cultivation -> greeting
+  // 3. Check specific agricultural domains in priority order: fertilizer -> trend -> scheme -> price -> disease -> weather -> cultivation -> greeting
   const domains = ["fertilizer", "trend", "scheme", "price", "disease", "weather", "cultivation", "greeting"];
 
   for (const intent of domains) {
@@ -99,6 +118,29 @@ function detectIntent(text) {
     }
   }
 
+  // 4. Check Affirmation intent ("Haan", "Yes", "Ho", etc.) when session has an active intent
+  if (isAffirmation(text) || context?.isAffirmation) {
+    if (context?.session?.lastIntent) {
+      return "affirmation";
+    }
+  }
+
+  // 5. Contextual Fallback Detection:
+  // If location is present (direct or standalone, e.g. "Nagpur", "Chikhli", "Buldhana")
+  if (context?.isLocationPresent) {
+    return "price";
+  }
+
+  // If crop is present (direct or standalone, e.g. "Soyabean", "Wheat")
+  if (context?.isCropPresent) {
+    return "price";
+  }
+
+  // If user entered only "rates" / "price" with active crop in session -> Price intent
+  if (context?.isRateOnly && (context?.mergedCrop || context?.session?.crop)) {
+    return "price";
+  }
+
   return "general";
 }
 
@@ -114,17 +156,17 @@ const RESPONSES = {
   },
 
   scheme: {
-    en: "🏛️ *Key Farmer Government Schemes*\n\n1. *PM-Kisan Samman Nidhi:* ₹6,000/year (3 installments of ₹2,000)\n2. *Namo Shetkari Yojana (Maharashtra):* Additional ₹6,000/year state support\n3. *PM Fasal Bima Yojana (PMFBY):* Crop insurance against weather risk\n4. *Kisan Credit Card (KCC):* Low-interest farm loans @ 4%\n\nWhich scheme would you like details or application status for?",
-    hi: "🏛️ *प्रमुख किसान सरकारी योजनाएं*\n\n1. *पीएम-किसान सम्मान निधि:* ₹6,000 प्रति वर्ष (3 किस्तों में ₹2,000)\n2. *नमो शेतकरी योजना (महाराष्ट्र):* ₹6,000 प्रति वर्ष अतिरिक्त सहायता\n3. *प्रधानमंत्री फसल बीमा योजना (PMFBY):* मौसम व प्राकृतिक आपदा से फसल सुरक्षा\n4. *किसान क्रेडिट कार्ड (KCC):* 4% सस्ती ब्याज दर पर कृषि ऋण\n\nआप किस योजना के बारे में विस्तार से जानना चाहते हैं या स्टेटस चेक करना चाहते हैं?",
-    mr: "🏛️ *शेतकरी शासकीय योजना माहिती*\n\n१. *पीएम-किसान सन्मान निधी:* वार्षिक ₹६,००० (३ हप्त्यांमध्ये ₹२,०००)\n२. *नमो शेतकरी महासन्मान निधी:* महाराष्ट्र शासनाचे अतिरिक्त ₹६,०००/वर्ष\n३. *प्रधानमंत्री पीक विमा योजना (PMFBY):* नैसर्गिक आपत्तींपासून पीक संरक्षण\n४. *किसान क्रेडिट कार्ड (KCC):* केवळ ४% सवलतीच्या व्याजदरात पीक कर्ज\n\nआपल्याला यापैकी कोणत्या योजनेची सविस्तर माहिती किंवा स्थिती जाणून घ्यायची आहे?",
-    hinglish: "🏛️ *Kisan Sarkari Yojana Alerts*\n\n1. *PM-Kisan Samman Nidhi:* ₹6,000/year (3 installments of ₹2,000)\n2. *Namo Shetkari Yojana (Maharashtra):* Additional ₹6,000/year state assistance\n3. *PM Fasal Bima Yojana (PMFBY):* Crop insurance against weather risk\n4. *Kisan Credit Card (KCC):* Low-interest farm loans @ 4%\n\nAapko kis yojana ke baare me detail ya status check karna hai?"
+    en: "🏛️ *Key Farmer Government Schemes*\n\n1. *PM-Kisan Samman Nidhi:* ₹6,000/year (3 installments of ₹2,000 directly via DBT)\n2. *MahaDBT Farmer Portal (Maharashtra):* Subsidies for tractors, drip/sprinkler irrigation & farm ponds\n3. *Namo Shetkari Yojana (Maharashtra):* Additional ₹6,000/year state support\n4. *PM Fasal Bima Yojana (PMFBY):* Weather and crop insurance\n5. *Kisan Credit Card (KCC):* Low-interest farm loans @ 4%\n\nWhich scheme would you like details or official portal links for?",
+    hi: "🏛️ *प्रमुख किसान सरकारी योजनाएं*\n\n1. *पीएम-किसान सम्मान निधि:* ₹6,000 प्रति वर्ष (DBT द्वारा 3 किस्तों में)\n2. *महाडीबीटी पोर्टल (महाराष्ट्र):* ट्रैक्टर, ड्रिप/स्प्रिंकलर और शेततळे पर 50% से 80% तक सब्सिडी\n3. *नमो शेतकरी योजना (महाराष्ट्र):* ₹6,000 प्रति वर्ष अतिरिक्त राज्य सहायता\n4. *प्रधानमंत्री फसल बीमा योजना (PMFBY):* फसल बीमा एवं आपदा सुरक्षा\n5. *किसान क्रेडिट कार्ड (KCC):* 4% सस्ती ब्याज दर पर कृषि ऋण\n\nआप किस योजना के बारे में विस्तार से जानना चाहते हैं?",
+    mr: "🏛️ *शेतकरी शासकीय योजना माहिती*\n\n१. *पीएम-किसान सन्मान निधी:* वार्षिक ₹६,००० (३ हप्त्यांमध्ये ₹२,००० थेट बँक खात्यात)\n२. *महाडीबीटी शेतकरी पोर्टल (महाराष्ट्र):* ट्रॅक्टर, ठिबक/तुषार सिंचन व शेततळे अनुदाने\n३. *नमो शेतकरी महासन्मान निधी:* महाराष्ट्र शासनाचे अतिरिक्त ₹६,०००/वर्ष\n४. *प्रधानमंत्री पीक विमा योजना (PMFBY):* नैसर्गिक आपत्तींपासून पीक संरक्षण\n५. *किसान क्रेडिट कार्ड (KCC):* केवळ ४% सवलतीच्या व्याजदरात पीक कर्ज\n\nआपल्याला यापैकी कोणत्या योजनेची सविस्तर माहिती हवी आहे?",
+    hinglish: "🏛️ *Kisan Sarkari Yojana Alerts*\n\n1. *PM-Kisan Samman Nidhi:* ₹6,000/year (3 installments of ₹2,000 via DBT)\n2. *MahaDBT Farmer Portal (Maharashtra):* Tractor, drip irrigation aur shet tale subsidies\n3. *Namo Shetkari Yojana (Maharashtra):* Additional ₹6,000/year state assistance\n4. *PM Fasal Bima Yojana (PMFBY):* Crop insurance against weather risk\n5. *Kisan Credit Card (KCC):* Low-interest farm loans @ 4%\n\nAapko kis yojana ke baare me specific jaankari chahiye?"
   },
 
   trend: {
-    en: "📈 *Mandi Market Trend & Analysis*\n\nMarket arrivals and prices fluctuate daily based on local demand, moisture levels, and terminal market movement.\n\n• For near-term selling, compare modal rates against your transport cost.\n• Prices often differ by ₹100–₹400/quintal across neighboring mandis on the same day.\n\nWhich crop and mandi would you like to compare today?",
-    hi: "📈 *मंडी बाजार रुझान (Market Trend)*\n\nफसलों के दैनिक भाव आवक (Arrivals), गुणवत्ता व नमी और टर्मिनल बाजार की मांग पर निर्भर करते हैं।\n\n• फसल बेचने से पहले नजदीकी मंडियों के मॉडल भाव और ढुलाई खर्च की तुलना जरूर करें।\n• पास-पास की मंडियों में एक ही दिन भाव में ₹100-₹400/क्विंटल का अंतर हो सकता है।\n\nआप किस फसल और मंडी का भाव देखना चाहते हैं?",
-    mr: "📈 *बाजारभाव कल व अंदाज (Market Trend)*\n\nबाजार समितीतील दर हे दैनंदिन आवक, पिकातील ओलावा आणि मोठ्या बाजारातील मागणीनुसार बदलतात.\n\n• माल विकण्यापूर्वी नजीकच्या बाजार समित्यांमधील सरासरी दर आणि वाहतूक खर्चाची तुलना करा.\n• एकाच दिवशी लगतच्या बाजार समित्यांमध्ये प्रति क्विंटल ₹१०० ते ₹४०० चा फरक असू शकतो.\n\nआपल्याला आज कोणत्या पिकाचा आणि बाजार समितीचा दर तपासायचा आहे?",
-    hinglish: "📈 *Mandi Market Trend & Analysis*\n\nFasal ke rates daily arrivals, quality/moisture aur overall market demand par depend karte hain.\n\n• Maal bechne se pehle nearby mandis ke modal rates aur transport kharch compare karein.\n• Peak arrival ke dauran paas ki mandis me ₹100-₹400/quintal ka difference aa sakta hai.\n\nAap kis fasal aur mandi ka comparative rate check karna chahte hain?"
+    en: "📈 *Mandi Market Outlook & Trend*\n\nMarket arrivals and prices fluctuate daily based on demand, moisture levels, and terminal market trends.\n\n• For near-term selling, always compare nearby mandis against your transport cost.\n• Prices often vary by ₹100–₹400/quintal across neighboring mandis on the same day.\n\nWhich crop and mandi would you like to compare today?",
+    hi: "📈 *मंडी बाजार रुझान (Market Trend)*\n\nफसलों के दैनिक भाव आवक, गुणवत्ता और मांग पर निर्भर करते हैं।\n\n• फसल बेचने से पहले नजदीकी मंडियों के मॉडल भाव और ढुलाई खर्च की तुलना जरूर करें।\n• पास-पास की मंडियों में एक ही दिन भाव में ₹100-₹400/क्विंटल का अंतर हो सकता है।\n\nआप किस फसल और मंडी का भाव देखना चाहते हैं?",
+    mr: "📈 *बाजारभाव कल व अंदाज (Market Trend)*\n\nबाजार समितीतील दर हे दैनंदिन आवक, पिकातील ओलावा आणि मागणीनुसार बदलतात.\n\n• माल विकण्यापूर्वी नजीकच्या बाजार समित्यांमधील सरासरी दर आणि वाहतूक खर्चाची तुलना करा.\n• एकाच दिवशी लगतच्या बाजार समित्यांमध्ये प्रति क्विंटल ₹१०० ते ₹४०० चा फरक असू शकतो.\n\nआपल्याला आज कोणत्या पिकाचा आणि बाजार समितीचा दर तपासायचा आहे?",
+    hinglish: "📈 *Mandi Market Outlook & Trend*\n\nFasal ke rates daily arrivals, quality aur market demand par depend karte hain.\n\n• Maal bechne se pehle nearby mandis ke rates aur transport cost compare karein.\n• Paas ki mandis me ₹100-₹400/quintal ka difference aa sakta hai.\n\nAap kis fasal aur mandi ka comparative rate check karna chahte hain?"
   },
 
   disease: {
@@ -159,9 +201,10 @@ const RESPONSES = {
 /**
  * Process any incoming WhatsApp message payload and generate a safe, language-tailored response
  * @param {object} message - WhatsApp webhook message object
+ * @param {string} [overrideUserId] - Optional user ID / sender phone number override
  * @returns {Promise<{ replyText: string, lang: string, type: string, intent?: string }>}
  */
-async function processIncomingMessage(message) {
+async function processIncomingMessage(message, overrideUserId = null) {
   const messageType = message?.type || "unknown";
 
   // 1. Handle Audio / Voice Notes
@@ -190,43 +233,92 @@ async function processIncomingMessage(message) {
 
   // 3. Handle Text Messages
   if (messageType === "text" || message?.text?.body) {
-    const textBody = message.text?.body || "";
-    const lang = detectLanguage(textBody);
-    const intent = detectIntent(textBody);
+    const textBody =
+      message.text?.body ||
+      message.interactive?.button_reply?.title ||
+      message.interactive?.list_reply?.title ||
+      message.button?.text ||
+      "";
 
-    console.log(`[ResponseHandler] Incoming Text: "${textBody}" | Lang: ${lang} | Intent: ${intent}`);
+    const userId = overrideUserId || message.from || message.userId || "default_user";
+    const context = resolveContextualEntities(userId, textBody);
+    const lang = detectLanguage(textBody);
+    const intent = detectIntent(textBody, context);
+
+    console.log(`[ResponseHandler] Incoming Text: "${textBody}" | User: ${userId} | Lang: ${lang} | Intent: ${intent}`);
 
     let rawReply = "";
 
-    // If intent is Transport / Mandi Net-Return Decision
-    if (intent === "transport_decision") {
-      console.log("[ResponseHandler] Routing to Mandi Decision Service");
-      rawReply = await getMandiDecisionResponse(textBody, lang);
+    // A. If Reset Request
+    if (context.isReset) {
+      resetSession(userId);
+      const templateGroup = RESPONSES.greeting;
+      rawReply = templateGroup[lang] || templateGroup.en || RESPONSES.greeting.en;
     }
-    // If intent is Fertilizer & Nutrient Advisory
+    // B. If Affirmation ("Haan", "Yes", "Ho", etc.)
+    else if (intent === "affirmation") {
+      console.log("[ResponseHandler] Routing to Affirmation Follow-Up Handler");
+      rawReply = getFollowUpResponse(context.session, textBody, lang);
+    }
+    // C. If intent is Transport / Mandi Net-Return Decision
+    else if (intent === "transport_decision") {
+      console.log("[ResponseHandler] Routing to Mandi Decision Service");
+      rawReply = await getMandiDecisionResponse(textBody, lang, undefined, {
+        crop: context.mergedCrop,
+        quantity: context.mergedQuantity,
+        village: context.mergedVillage,
+        district: context.mergedDistrict
+      });
+    }
+    // D. If intent is Government Scheme Information
+    else if (intent === "scheme") {
+      console.log("[ResponseHandler] Routing to Scheme Service");
+      rawReply = getSchemeResponse(textBody, lang);
+      const topic = identifySchemeTopic(textBody);
+      context.session.lastSubTopic = topic;
+    }
+    // E. If intent is Fertilizer & Nutrient Advisory
     else if (intent === "fertilizer") {
       console.log("[ResponseHandler] Routing to Fertilizer Advisory Service");
-      rawReply = await getFertilizerAdvisoryResponse(textBody, lang);
+      rawReply = await getFertilizerAdvisoryResponse(textBody, lang, undefined, {
+        crop: context.mergedCrop
+      });
     }
-    // If intent is Mandi Price
+    // F. If intent is Mandi Price
     else if (intent === "price") {
       console.log("[ResponseHandler] Routing to Mandi Price Service");
-      rawReply = await getMandiPriceResponse(textBody, lang);
+      rawReply = await getMandiPriceResponse(textBody, lang, undefined, {
+        crop: context.mergedCrop,
+        district: context.mergedDistrict
+      });
     }
-    // If intent is Agromet Weather Advisory
+    // G. If intent is Agromet Weather Advisory
     else if (intent === "weather") {
       console.log("[ResponseHandler] Routing to Weather Advisory Service");
-      rawReply = await getWeatherAdvisoryResponse(textBody, lang);
+      rawReply = await getWeatherAdvisoryResponse(textBody, lang, undefined, {
+        location: context.mergedVillage?.standardName || context.mergedDistrict
+      });
     }
-    // If intent is Crop Cultivation / PDKV PoP Advisory
+    // H. If intent is Crop Cultivation / PDKV PoP Advisory
     else if (intent === "cultivation") {
       console.log("[ResponseHandler] Routing to Crop Advisory Service");
-      rawReply = await getCropAdvisoryResponse(textBody, lang);
+      rawReply = await getCropAdvisoryResponse(textBody, lang, {
+        crop: context.mergedCrop
+      });
     } else {
       console.log(`[ResponseHandler] Routing to default template: ${intent}`);
       const templateGroup = RESPONSES[intent] || RESPONSES.general;
       rawReply = templateGroup[lang] || templateGroup.en || RESPONSES.general.en;
     }
+
+    // Update session tracking state
+    context.session.lastIntent = intent;
+    context.session.lastLanguage = lang;
+    context.session.history.push({
+      text: textBody,
+      intent,
+      timestamp: Date.now()
+    });
 
     const safeReply = validateAndSanitizeResponse(rawReply, lang);
 
@@ -254,4 +346,6 @@ module.exports = {
   processIncomingMessage,
   detectIntent,
   RESPONSES,
+  INTENT_KEYWORDS,
 };
+

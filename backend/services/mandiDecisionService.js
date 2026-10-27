@@ -69,12 +69,18 @@ function isTransportDecisionIntent(text) {
  * @param {string} text - Farmer input text
  * @param {'en' | 'hi' | 'mr' | 'hinglish'} lang - Detected language
  * @param {Function} [fetchFn] - Optional mock fetcher for testing
+ * @param {object} [contextOverrides] - Optional context overrides from session memory
  * @returns {Promise<string>}
  */
-async function getMandiDecisionResponse(text, lang, fetchFn = fetchOfficialMandiPrices) {
-  const { crop, district: explicitMandi } = extractMandiEntities(text);
-  const quantity = extractQuantity(text);
-  const village = extractFarmerVillage(text);
+async function getMandiDecisionResponse(text, lang, fetchFn = fetchOfficialMandiPrices, contextOverrides = {}) {
+  const { crop: directCrop, district: directExplicitMandi } = extractMandiEntities(text);
+  const directQuantity = extractQuantity(text);
+  const directVillage = extractFarmerVillage(text);
+
+  const crop = directCrop || contextOverrides?.crop || null;
+  const explicitMandi = directExplicitMandi || contextOverrides?.district || null;
+  const quantity = directQuantity !== null ? directQuantity : (contextOverrides?.quantity !== undefined ? contextOverrides.quantity : null);
+  const village = directVillage || contextOverrides?.village || null;
 
   const cropName = crop?.displayName?.[lang] || crop?.displayName?.en || crop?.standardName || (lang === "mr" ? "सोयाबीन" : lang === "hi" ? "सोयाबीन" : "Soybean");
   const cropStandard = crop?.standardName || "Soyabean";
@@ -112,47 +118,75 @@ async function getMandiDecisionResponse(text, lang, fetchFn = fetchOfficialMandi
   }
 
   // 4. Calculate Net Return for Each Mandi
-  const mandiResults = [];
+  let stateRecords = [];
+  try {
+    stateRecords = await fetchFn({ commodity: cropStandard, state: "Maharashtra" });
+  } catch (err) {
+    console.log("State records pre-fetch skipped:", err?.message || err);
+  }
 
-  for (const mandiName of candidateMandis) {
-    const dist = getDistanceKm(village.key, mandiName);
-    const transportCalc = dist !== null
-      ? calculateTransportCost({ distanceKm: dist, quantityQtl: quantity })
-      : null;
+  const mandiResults = await Promise.all(
+    candidateMandis.map(async (mandiName) => {
+      const dist = getDistanceKm(village.key, mandiName);
+      const transportCalc = dist !== null
+        ? calculateTransportCost({ distanceKm: dist, quantityQtl: quantity })
+        : null;
 
-    // Fetch official live price
-    const records = await fetchFn({
-      commodity: cropStandard,
-      district: mandiName
-    });
+      let records = [];
+      const mandiLower = mandiName.toLowerCase();
 
-    let price = null;
-    let modalPrice = null;
-    let grossValue = null;
-    let netReturn = null;
-
-    if (records && records.length > 0 && records[0].modal_price) {
-      modalPrice = parseFloat(records[0].modal_price);
-      if (!isNaN(modalPrice) && modalPrice > 0) {
-        price = modalPrice;
-        grossValue = Math.round(price * quantity);
-        if (transportCalc) {
-          netReturn = grossValue - transportCalc.estimatedCost;
+      // 1. Check pre-fetched state records first (avoids duplicate network calls & HTTP 429 rate limits)
+      if (stateRecords && stateRecords.length > 0) {
+        const matched = stateRecords.filter(r => 
+          (r.market || "").toLowerCase().includes(mandiLower) ||
+          (r.district || "").toLowerCase().includes(mandiLower)
+        );
+        if (matched.length > 0) {
+          records = matched;
         }
       }
-    }
 
-    mandiResults.push({
-      mandiName,
-      distanceKm: dist,
-      transportCost: transportCalc ? transportCalc.estimatedCost : null,
-      perQtlTransport: transportCalc ? transportCalc.perQuintalCost : null,
-      price,
-      grossValue,
-      netReturn,
-      hasLivePrice: price !== null
-    });
-  }
+      // 2. Only fetch individual district if not found in pre-fetched state records
+      if (records.length === 0) {
+        try {
+          records = await fetchFn({
+            commodity: cropStandard,
+            district: mandiName
+          });
+        } catch (fetchErr) {
+          console.error(`Error fetching prices for candidate mandi ${mandiName}:`, fetchErr?.message || fetchErr);
+          records = [];
+        }
+      }
+
+      let price = null;
+      let modalPrice = null;
+      let grossValue = null;
+      let netReturn = null;
+
+      if (records && records.length > 0 && records[0].modal_price) {
+        modalPrice = parseFloat(records[0].modal_price);
+        if (!isNaN(modalPrice) && modalPrice > 0) {
+          price = modalPrice;
+          grossValue = Math.round(price * quantity);
+          if (transportCalc) {
+            netReturn = grossValue - transportCalc.estimatedCost;
+          }
+        }
+      }
+
+      return {
+        mandiName,
+        distanceKm: dist,
+        transportCost: transportCalc ? transportCalc.estimatedCost : null,
+        perQtlTransport: transportCalc ? transportCalc.perQuintalCost : null,
+        price,
+        grossValue,
+        netReturn,
+        hasLivePrice: price !== null
+      };
+    })
+  );
 
   // 5. Determine Optimal Recommendation
   const validNetReturns = mandiResults.filter(r => r.netReturn !== null);
@@ -196,8 +230,11 @@ function formatDecisionOutput({ lang, cropName, quantity, villageName, mandiResu
       text += `\n📍 *${displayMandi} बाजार समिती* (${r.distanceKm !== null ? r.distanceKm + " किमी" : "अंतर उपलब्ध नाही"})\n`;
       if (r.hasLivePrice) {
         text += `• बाजारभाव: ₹${r.price} / क्विंटल\n`;
-        text += `• अंदाजित वाहतूक: ₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/क्विंटल)\n`;
-        text += `• *अंदाजित निव्वळ नफा (Net Return): ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        const transportStr = r.transportCost !== null ? `₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/क्विंटल)` : "अंतर/वाहतूक उपलब्ध नाही";
+        text += `• अंदाजित वाहतूक: ${transportStr}\n`;
+        if (r.netReturn !== null) {
+          text += `• *अंदाजित निव्वळ नफा (Net Return): ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        }
       } else {
         text += `• अंदाजित वाहतूक: ₹${r.transportCost ? r.transportCost.toLocaleString("en-IN") : "उपलब्ध नाही"}\n`;
         text += `• _(अधिकृत थेट दर आज उपलब्ध नाही)_\n`;
@@ -228,8 +265,11 @@ function formatDecisionOutput({ lang, cropName, quantity, villageName, mandiResu
       text += `\n📍 *${displayMandi} मंडी* (${r.distanceKm !== null ? r.distanceKm + " किमी" : "दूरी उपलब्ध नहीं"})\n`;
       if (r.hasLivePrice) {
         text += `• मंडी भाव: ₹${r.price} / क्विंटल\n`;
-        text += `• अनुमानित ढुलाई: ₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/क्विंटल)\n`;
-        text += `• *अनुमानित शुद्ध मुनाफा (Net Return): ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        const transportStr = r.transportCost !== null ? `₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/क्विंटल)` : "दूरी/ढुलाई उपलब्ध नहीं";
+        text += `• अनुमानित ढुलाई: ${transportStr}\n`;
+        if (r.netReturn !== null) {
+          text += `• *अनुमानित शुद्ध मुनाफा (Net Return): ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        }
       } else {
         text += `• अनुमानित ढुलाई: ₹${r.transportCost ? r.transportCost.toLocaleString("en-IN") : "उपलब्ध नहीं"}\n`;
         text += `• _(आधिकारिक लाइव भाव आज उपलब्ध नहीं)_\n`;
@@ -260,8 +300,11 @@ function formatDecisionOutput({ lang, cropName, quantity, villageName, mandiResu
       text += `\n📍 *${displayMandi} Mandi* (${r.distanceKm !== null ? r.distanceKm + " km" : "Distance N/A"})\n`;
       if (r.hasLivePrice) {
         text += `• Market Rate: ₹${r.price} / Quintal\n`;
-        text += `• Est. Transport: ₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/qtl)\n`;
-        text += `• *Estimated Net Return: ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        const transportStr = r.transportCost !== null ? `₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/qtl)` : "Distance/Transport N/A";
+        text += `• Est. Transport: ${transportStr}\n`;
+        if (r.netReturn !== null) {
+          text += `• *Estimated Net Return: ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+        }
       } else {
         text += `• Est. Transport: ₹${r.transportCost ? r.transportCost.toLocaleString("en-IN") : "N/A"}\n`;
         text += `• _(Official live price not available today)_\n`;
@@ -292,8 +335,11 @@ function formatDecisionOutput({ lang, cropName, quantity, villageName, mandiResu
     text += `\n📍 *${displayMandi} Mandi* (${r.distanceKm !== null ? r.distanceKm + " km" : "Distance N/A"})\n`;
     if (r.hasLivePrice) {
       text += `• Market Rate: ₹${r.price} / Quintal\n`;
-      text += `• Est. Transport: ₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/qtl)\n`;
-      text += `• *Estimated Net Return: ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+      const transportStr = r.transportCost !== null ? `₹${r.transportCost.toLocaleString("en-IN")} (~₹${r.perQtlTransport}/qtl)` : "Distance/Transport N/A";
+      text += `• Est. Transport: ${transportStr}\n`;
+      if (r.netReturn !== null) {
+        text += `• *Estimated Net Return: ₹${r.netReturn.toLocaleString("en-IN")}*\n`;
+      }
     } else {
       text += `• Est. Transport: ₹${r.transportCost ? r.transportCost.toLocaleString("en-IN") : "N/A"}\n`;
       text += `• _(Official live price not available today)_\n`;

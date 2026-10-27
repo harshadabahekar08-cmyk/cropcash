@@ -17,7 +17,12 @@ const MARATHI_WORDS = new Set([
   "करा", "करावे", "कसे", "काय", "किती", "मला", "माझे", "माझ्या", "माझा",
   "आम्ही", "करतो", "झाले", "झाली", "पाहिजे", "कधी", "कसा", "कोणते",
   "कोणता", "बियाणे", "हवामान", "पाऊस", "कापूस", "सोयाबीन", "तूर", "ऊस",
-  "कांदा", "रोग", "कीड", "फवारणी", "अनुदान", "कर्ज", "योजना", "मदत"
+  "कांदा", "रोग", "कीड", "फवारणी", "अनुदान", "कर्ज", "योजना", "मदत",
+  "लातूर", "चिखली", "खामगाव", "बुलढाणा", "अकोला", "नागपूर", "पुणे",
+  "नाशिक", "सातारा", "सांगली", "सोलापूर", "कोल्हापूर", "जळगाव", "अहमदनगर",
+  "वाशीम", "यवतमाळ", "हिंगोली", "परभणी", "नांदेड", "बीड", "उस्मानाबाद",
+  "धाराशिव", "संभाजीनगर", "मोताळा", "शेगाव", "मलकापूर", "मेहकर", "नांदुरा",
+  "२०", "क्विंटल", "दर"
 ]);
 
 // Distinctive Hindi words / verbal markers (in Devanagari)
@@ -28,7 +33,9 @@ const HINDI_WORDS = new Set([
   "हम", "करता", "करते", "करती", "होगा", "होगी", "चाहिए", "कब", "कैसा",
   "कौनसा", "कौनसी", "बीज", "मौसम", "बारिश", "गेहूं", "धान", "चना",
   "कपास", "सोयाबीन", "गन्ना", "प्याज", "बीमारी", "कीड़े", "छिड़काव",
-  "अनुदान", "ऋण", "कर्ज", "योजना", "मदद"
+  "अनुदान", "ऋण", "कर्ज", "योजना", "मदद",
+  "इंदौर", "भोपाल", "उज्जैन", "जबलपुर", "ग्वालियर", "जयपुर", "कोटा",
+  "कानपुर", "लखनऊ", "आगरा", "प्रयागराज", "बनारस", "वाराणसी"
 ]);
 
 // Distinctive Hinglish words & Hindi functional particles in Latin script
@@ -38,12 +45,13 @@ const HINGLISH_STRONG_WORDS = new Set([
   "kitna", "kitne", "kitni", "mera", "meri", "mere", "mujhe", "chahiye",
   "krishi", "kheti", "gehu", "gehun", "dhan", "chana", "pyaj", "tamatar",
   "aalu", "soya", "soyabean", "soybean", "kapas", "ganna", "rog", "bimari", "keeda",
-  "keede", "dawai", "upchar", "chidkaw", "fawarni", "yojana", "karj", "rin",
+  "keede", "dawai", "upchar", "chidkaw", "fawarni", "yojana", "yojna", "karj", "rin",
   "kcc", "kab", "kya", "kyu", "kyun", "kaunsa", "hoga", "hogi", "hai",
   "hain", "nahi", "nahin", "theek", "shuru", "karo", "kare", "bhejo",
   "shetkari", "bajarbhav", "pik", "ka", "ki", "ke", "me", "mein", "se", "ko", "par", "pe",
   "aur", "bhi", "lag", "gaya", "gayi", "aaj", "kaha", "kahan", "bechu", "bechna",
-  "paas", "hoon", "aap", "gaon", "gaav", "kuthe", "viku", "bhada", "bhadu"
+  "paas", "hoon", "aap", "gaon", "gaav", "kuthe", "viku", "bhada", "bhadu",
+  "sarkari", "subsidy", "subsidies", "anudan", "mahadbt", "dbt", "kisan"
 ]);
 
 // Standard English words / functional markers

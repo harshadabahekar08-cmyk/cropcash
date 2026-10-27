@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/mandiPriceService.test.js && node tests/mandiDecision.test.js && node tests/diseaseDetector.test.js && node tests/fertilizerAdvisory.test.js && node tests/openAgriNet.test.js && node tests/weatherAdvisory.test.js && node tests/pdkvKnowledgeBase.test.js"
+    "test": "node tests/mandiPriceService.test.js && node tests/mandiDecision.test.js && node tests/diseaseDetector.test.js && node tests/fertilizerAdvisory.test.js && node tests/openAgriNet.test.js && node tests/weatherAdvisory.test.js && node tests/pdkvKnowledgeBase.test.js && node tests/schemeAwareness.test.js && node tests/conversationContext.test.js && node tests/webhookPipeline.test.js"
   },
   "keywords": [],
   "author": "",
