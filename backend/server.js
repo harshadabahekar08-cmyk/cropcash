@@ -1,14 +1,67 @@
 const express = require("express");
 const cors = require("cors");
-require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+// Load .env from backend/.env, root .env, or Render Secret Files (/etc/secrets/.env)
+[
+  path.join(__dirname, ".env"),
+  path.join(__dirname, "..", ".env"),
+  "/etc/secrets/.env"
+].forEach((envPath) => {
+  try {
+    if (fs.existsSync(envPath)) {
+      require("dotenv").config({ path: envPath });
+    }
+  } catch (err) {
+    // Ignore inaccessible paths
+  }
+});
+
 const { processIncomingMessage } = require("./services/responseHandler");
 const { isValidIncomingMessage } = require("./services/safetyValidator");
 
 const app = express();
 
+/**
+ * Safely resolves an environment variable by checking multiple aliases and case-insensitivity
+ * @param {...string} keys - Candidate environment variable keys
+ * @returns {string} Sanitized string value (without surrounding quotes or whitespace)
+ */
+function getEnvSafe(...keys) {
+  for (const k of keys) {
+    if (process.env[k] && typeof process.env[k] === "string" && process.env[k].trim()) {
+      return process.env[k].trim().replace(/^["']|["']$/g, "");
+    }
+    const lowerKey = k.toLowerCase();
+    const match = Object.keys(process.env).find((envKey) => envKey.toLowerCase() === lowerKey);
+    if (match && process.env[match] && typeof process.env[match] === "string" && process.env[match].trim()) {
+      return process.env[match].trim().replace(/^["']|["']$/g, "");
+    }
+  }
+  return "";
+}
+
+// Normalize aliases into standard keys on process.env so all sub-services have them
+const standardKeyAliases = {
+  VERIFY_TOKEN: ["WHATSAPP_VERIFY_TOKEN", "META_VERIFY_TOKEN", "WEBHOOK_VERIFY_TOKEN"],
+  ACCESS_TOKEN: ["WHATSAPP_ACCESS_TOKEN", "META_ACCESS_TOKEN", "GRAPH_API_TOKEN", "WHATSAPP_TOKEN"],
+  PHONE_NUMBER_ID: ["WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID", "PHONE_ID"],
+  APP_SECRET: ["META_APP_SECRET", "WHATSAPP_APP_SECRET"],
+  DATA_GOV_IN_API_KEY: ["DATA_GOV_KEY", "AGMARKNET_API_KEY", "MANDI_API_KEY"],
+  GEMINI_API_KEY: ["GOOGLE_API_KEY", "GEMINI_KEY"]
+};
+
+for (const [standardKey, aliases] of Object.entries(standardKeyAliases)) {
+  const resolved = getEnvSafe(standardKey, ...aliases);
+  if (resolved && !process.env[standardKey]) {
+    process.env[standardKey] = resolved;
+  }
+}
+
 function verifyMetaSignature(req) {
-  const appSecret = (process.env.APP_SECRET || "").trim().replace(/^["']|["']$/g, "");
+  const appSecret = getEnvSafe("APP_SECRET", "META_APP_SECRET", "WHATSAPP_APP_SECRET");
   const signature = req.headers["x-hub-signature-256"];
 
   // If no APP_SECRET is configured, permit request
@@ -71,17 +124,26 @@ app.get("/", (req, res) => {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  const verifyToken = (process.env.VERIFY_TOKEN || "").trim().replace(/^["']|["']$/g, "");
-  const accessToken = (process.env.ACCESS_TOKEN || "").trim().replace(/^["']|["']$/g, "");
-  const phoneNumberId = (process.env.PHONE_NUMBER_ID || "").trim().replace(/^["']|["']$/g, "");
-  const appSecret = (process.env.APP_SECRET || "").trim().replace(/^["']|["']$/g, "");
-  const dataGovKey = (process.env.DATA_GOV_IN_API_KEY || "").trim().replace(/^["']|["']$/g, "");
-  const geminiKey = (process.env.GEMINI_API_KEY || "").trim().replace(/^["']|["']$/g, "");
+  const verifyToken = getEnvSafe("VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN", "META_VERIFY_TOKEN", "WEBHOOK_VERIFY_TOKEN");
+  const accessToken = getEnvSafe("ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN", "META_ACCESS_TOKEN", "GRAPH_API_TOKEN", "WHATSAPP_TOKEN");
+  const phoneNumberId = getEnvSafe("PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID", "PHONE_ID");
+  const appSecret = getEnvSafe("APP_SECRET", "META_APP_SECRET", "WHATSAPP_APP_SECRET");
+  const dataGovKey = getEnvSafe("DATA_GOV_IN_API_KEY", "DATA_GOV_KEY", "AGMARKNET_API_KEY", "MANDI_API_KEY");
+  const geminiKey = getEnvSafe("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY");
+
+  const systemKeys = new Set([
+    "PATH", "NODE_VERSION", "YARN_VERSION", "HOME", "USER", "HOSTNAME",
+    "PWD", "SHLVL", "_", "NODE_ENV", "PORT", "RENDER", "RENDER_SERVICE_ID",
+    "RENDER_SERVICE_NAME", "RENDER_SERVICE_TYPE", "RENDER_INSTANCE_ID",
+    "RENDER_GIT_COMMIT", "RENDER_GIT_BRANCH", "RENDER_GIT_REPO_SLUG",
+    "IS_PULL_REQUEST"
+  ]);
+  const userConfiguredKeys = Object.keys(process.env).filter(k => !systemKeys.has(k) && !k.startsWith("npm_"));
 
   res.status(200).json({
     status: "ok",
     service: "CropCash Backend",
-    deployedCommit: process.env.RENDER_GIT_COMMIT || "1e547f6",
+    deployedCommit: process.env.RENDER_GIT_COMMIT || "8abb6cd",
     uptime: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     environment: {
@@ -94,14 +156,20 @@ app.get("/health", (req, res) => {
       hasGeminiKey: Boolean(geminiKey),
       verifyTokenLength: verifyToken ? verifyToken.length : 0,
       accessTokenLength: accessToken ? accessToken.length : 0,
-      phoneNumberIdLength: phoneNumberId ? phoneNumberId.length : 0
+      phoneNumberIdLength: phoneNumberId ? phoneNumberId.length : 0,
+      detectedVariableKeys: userConfiguredKeys,
+      secretFileExists: {
+        backendEnv: fs.existsSync(path.join(__dirname, ".env")),
+        rootEnv: fs.existsSync(path.join(__dirname, "..", ".env")),
+        renderSecretEnv: fs.existsSync("/etc/secrets/.env")
+      }
     }
   });
 });
 
 // WhatsApp Webhook Verification
 app.get("/webhook", (req, res) => {
-  const expectedToken = (process.env.VERIFY_TOKEN || "").trim().replace(/^["']|["']$/g, "");
+  const expectedToken = getEnvSafe("VERIFY_TOKEN", "WHATSAPP_VERIFY_TOKEN", "META_VERIFY_TOKEN", "WEBHOOK_VERIFY_TOKEN");
 
   const mode = req.query["hub.mode"];
   const receivedToken = (req.query["hub.verify_token"] || "").trim().replace(/^["']|["']$/g, "");
@@ -325,11 +393,10 @@ async function processSingleIncomingMessage(message, containerValue, customFetch
 
     phoneNumberId = (
       containerValue?.metadata?.phone_number_id ||
-      process.env.PHONE_NUMBER_ID ||
-      ""
+      getEnvSafe("PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID", "PHONE_ID")
     ).trim().replace(/^["']|["']$/g, "");
 
-    accessToken = (process.env.ACCESS_TOKEN || "").trim().replace(/^["']|["']$/g, "");
+    accessToken = getEnvSafe("ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN", "META_ACCESS_TOKEN", "GRAPH_API_TOKEN", "WHATSAPP_TOKEN");
 
     if (!phoneNumberId || !accessToken) {
       if (!phoneNumberId) {
@@ -382,10 +449,12 @@ async function processSingleIncomingMessage(message, containerValue, customFetch
     releaseMessageLock(messageId);
 
     // Attempt graceful fallback notice to user if sender and credentials exist
-    if (from && (phoneNumberId || process.env.PHONE_NUMBER_ID?.trim()) && (accessToken || process.env.ACCESS_TOKEN?.trim())) {
+    const envPhone = getEnvSafe("PHONE_NUMBER_ID", "WHATSAPP_PHONE_NUMBER_ID", "META_PHONE_NUMBER_ID", "PHONE_ID");
+    const envToken = getEnvSafe("ACCESS_TOKEN", "WHATSAPP_ACCESS_TOKEN", "META_ACCESS_TOKEN", "GRAPH_API_TOKEN", "WHATSAPP_TOKEN");
+    if (from && (phoneNumberId || envPhone) && (accessToken || envToken)) {
       try {
-        const fallbackPhoneId = phoneNumberId || process.env.PHONE_NUMBER_ID?.trim().replace(/^["']|["']$/g, "");
-        const fallbackToken = accessToken || process.env.ACCESS_TOKEN?.trim().replace(/^["']|["']$/g, "");
+        const fallbackPhoneId = phoneNumberId || envPhone;
+        const fallbackToken = accessToken || envToken;
         await sendWhatsAppReply({
           phoneNumberId: fallbackPhoneId,
           accessToken: fallbackToken,
