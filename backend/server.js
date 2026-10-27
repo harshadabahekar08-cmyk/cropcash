@@ -8,7 +8,7 @@ const { isValidIncomingMessage } = require("./services/safetyValidator");
 const app = express();
 
 function verifyMetaSignature(req) {
-  const appSecret = process.env.APP_SECRET?.trim();
+  const appSecret = (process.env.APP_SECRET || "").trim().replace(/^["']|["']$/g, "");
   const signature = req.headers["x-hub-signature-256"];
 
   // If no APP_SECRET is configured, permit request
@@ -34,15 +34,22 @@ function verifyMetaSignature(req) {
         .digest("hex");
 
     if (signature.length !== expectedSignature.length) {
+      console.error(`[Webhook Security Mismatch] Signature length: ${signature.length} vs Expected: ${expectedSignature.length}`);
       return false;
     }
 
-    return crypto.timingSafeEqual(
+    const isValid = crypto.timingSafeEqual(
       Buffer.from(signature),
       Buffer.from(expectedSignature)
     );
+
+    if (!isValid) {
+      console.error(`[Webhook Security Mismatch] Signature does not match expected HMAC for configured APP_SECRET.`);
+    }
+
+    return isValid;
   } catch (err) {
-    console.error("Signature verification error:", err);
+    console.error("Signature verification error:", err?.message || err);
     return false;
   }
 }
@@ -64,29 +71,50 @@ app.get("/", (req, res) => {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
+  const verifyToken = (process.env.VERIFY_TOKEN || "").trim().replace(/^["']|["']$/g, "");
+  const accessToken = (process.env.ACCESS_TOKEN || "").trim().replace(/^["']|["']$/g, "");
+  const phoneNumberId = (process.env.PHONE_NUMBER_ID || "").trim().replace(/^["']|["']$/g, "");
+  const appSecret = (process.env.APP_SECRET || "").trim().replace(/^["']|["']$/g, "");
+  const dataGovKey = (process.env.DATA_GOV_IN_API_KEY || "").trim().replace(/^["']|["']$/g, "");
+  const geminiKey = (process.env.GEMINI_API_KEY || "").trim().replace(/^["']|["']$/g, "");
+
   res.status(200).json({
     status: "ok",
     service: "CropCash Backend",
-    timestamp: new Date().toISOString()
+    deployedCommit: process.env.RENDER_GIT_COMMIT || "1e547f6",
+    uptime: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+    environment: {
+      nodeEnv: process.env.NODE_ENV || "development",
+      hasVerifyToken: Boolean(verifyToken),
+      hasAccessToken: Boolean(accessToken),
+      hasPhoneNumberId: Boolean(phoneNumberId),
+      hasAppSecret: Boolean(appSecret),
+      hasDataGovKey: Boolean(dataGovKey),
+      hasGeminiKey: Boolean(geminiKey),
+      verifyTokenLength: verifyToken ? verifyToken.length : 0,
+      accessTokenLength: accessToken ? accessToken.length : 0,
+      phoneNumberIdLength: phoneNumberId ? phoneNumberId.length : 0
+    }
   });
 });
 
 // WhatsApp Webhook Verification
 app.get("/webhook", (req, res) => {
-  const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+  const expectedToken = (process.env.VERIFY_TOKEN || "").trim().replace(/^["']|["']$/g, "");
 
   const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
+  const receivedToken = (req.query["hub.verify_token"] || "").trim().replace(/^["']|["']$/g, "");
   const challenge = req.query["hub.challenge"];
 
-  console.log(`[Webhook Verification] Mode: ${mode} | Token received: ${token ? "YES" : "NO"}`);
+  console.log(`[Webhook Verification] Mode: ${mode} | Token Received: ${receivedToken ? "YES" : "NO"} (len: ${receivedToken.length}) | Expected Token Configured: ${expectedToken ? "YES" : "NO"} (len: ${expectedToken.length})`);
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+  if (mode === "subscribe" && receivedToken && receivedToken === expectedToken) {
     console.log("✅ Webhook verified successfully with Meta challenge!");
-    res.status(200).send(challenge);
+    return res.status(200).send(challenge);
   } else {
-    console.error("❌ Webhook verification failed: Token mismatch or invalid mode.");
-    res.sendStatus(403);
+    console.error(`❌ Webhook verification failed: Token mismatch (Received len ${receivedToken.length} vs Expected len ${expectedToken.length}) or invalid mode (${mode}).`);
+    return res.sendStatus(403);
   }
 });
 
@@ -255,29 +283,7 @@ async function sendWhatsAppReply({
 // ============================================================================
 // ASYNC WEBHOOK PAYLOAD PROCESSOR
 // ============================================================================
-async function handleIncomingWebhookPayload(body, options = {}) {
-  const customFetch = options.fetchFn || fetch;
-  const entry = body?.entry?.[0];
-  const change = entry?.changes?.[0];
-  const value = change?.value;
-
-  // A. Handle Status Updates (sent, delivered, read, failed)
-  if (value?.statuses && value.statuses.length > 0) {
-    const statusObj = value.statuses[0];
-    const statusRecipient = maskPhoneNumber(statusObj.recipient_id || statusObj.wa_id);
-    console.log(`[WhatsApp Status Update] ${statusObj.status?.toUpperCase()} | Recipient: ${statusRecipient}`);
-    if (statusObj.status === "failed" && statusObj.errors) {
-      console.error(`[WhatsApp Status Error]:`, JSON.stringify(sanitizeMetaError(statusObj.errors[0] || statusObj.errors)));
-    }
-    return { status: "status_update_handled" };
-  }
-
-  // B. Extract Message Object
-  const message =
-    value?.messages?.[0] ||
-    body?.messages?.[0] ||
-    (body?.type || body?.text ? body : null);
-
+async function processSingleIncomingMessage(message, containerValue, customFetch) {
   const messageType = message?.type || (message?.text ? "text" : "unknown");
 
   if (!message || !isValidIncomingMessage(message)) {
@@ -287,7 +293,7 @@ async function handleIncomingWebhookPayload(body, options = {}) {
 
   const messageId = message.id || null;
 
-  // C. Deduplicate message ID to prevent duplicate replies from network retries
+  // Deduplicate message ID to prevent duplicate replies from network retries
   if (messageId && !acquireMessageLock(messageId)) {
     console.log(`[Duplicate Webhook] Skipping duplicate or currently processing message ID: ${messageId}`);
     return { status: "duplicate_skipped", messageId };
@@ -296,11 +302,10 @@ async function handleIncomingWebhookPayload(body, options = {}) {
   let from = null;
   let phoneNumberId = null;
   let accessToken = null;
-  const apiVersion = process.env.GRAPH_API_VERSION || "v21.0";
+  const apiVersion = (process.env.GRAPH_API_VERSION || "v21.0").trim().replace(/^["']|["']$/g, "");
 
   try {
-    // D. Sender phone number extraction & sanitization
-    const rawFrom = message.from || value?.contacts?.[0]?.wa_id || body?.from;
+    const rawFrom = message.from || containerValue?.contacts?.[0]?.wa_id || containerValue?.from;
     from = rawFrom ? String(rawFrom).replace(/[^0-9]/g, "") : null;
 
     const messageText =
@@ -318,15 +323,17 @@ async function handleIncomingWebhookPayload(body, options = {}) {
       return { status: "error_missing_from" };
     }
 
-    // E. Verify Environment Credentials
-    phoneNumberId =
-      value?.metadata?.phone_number_id ||
-      process.env.PHONE_NUMBER_ID?.trim();
-    accessToken = process.env.ACCESS_TOKEN?.trim();
+    phoneNumberId = (
+      containerValue?.metadata?.phone_number_id ||
+      process.env.PHONE_NUMBER_ID ||
+      ""
+    ).trim().replace(/^["']|["']$/g, "");
+
+    accessToken = (process.env.ACCESS_TOKEN || "").trim().replace(/^["']|["']$/g, "");
 
     if (!phoneNumberId || !accessToken) {
       if (!phoneNumberId) {
-        console.error("❌ Configuration missing: PHONE_NUMBER_ID is not configured in environment.");
+        console.error("❌ Configuration missing: PHONE_NUMBER_ID is not configured in environment or webhook metadata.");
       }
       if (!accessToken) {
         console.error("❌ Configuration missing: ACCESS_TOKEN is not configured in environment.");
@@ -335,11 +342,11 @@ async function handleIncomingWebhookPayload(body, options = {}) {
       return { status: "error_missing_credentials" };
     }
 
-    // F. Process Message through CropCash AI & Decision Pipeline
+    // Process Message through CropCash AI & Decision Pipeline
     const { replyText, lang, type, intent } = await processIncomingMessage(message, from);
     console.log(`[Response Generated] Language: ${lang} | Intent: ${intent || "N/A"} | Length: ${replyText.length} chars`);
 
-    // G. Send Reply to WhatsApp Cloud API
+    // Send Reply to WhatsApp Cloud API
     console.log(`[WhatsApp API Request] Dispatching reply to ${maskPhoneNumber(from)} via Phone ID: ${maskIdentifier(phoneNumberId)}...`);
     const sendResult = await sendWhatsAppReply({
       phoneNumberId,
@@ -372,14 +379,13 @@ async function handleIncomingWebhookPayload(body, options = {}) {
 
   } catch (error) {
     console.error("❌ Error processing WhatsApp message:", error?.message || error);
-    // Evict failed message ID from deduplication so retry is possible
     releaseMessageLock(messageId);
 
     // Attempt graceful fallback notice to user if sender and credentials exist
     if (from && (phoneNumberId || process.env.PHONE_NUMBER_ID?.trim()) && (accessToken || process.env.ACCESS_TOKEN?.trim())) {
       try {
-        const fallbackPhoneId = phoneNumberId || process.env.PHONE_NUMBER_ID?.trim();
-        const fallbackToken = accessToken || process.env.ACCESS_TOKEN?.trim();
+        const fallbackPhoneId = phoneNumberId || process.env.PHONE_NUMBER_ID?.trim().replace(/^["']|["']$/g, "");
+        const fallbackToken = accessToken || process.env.ACCESS_TOKEN?.trim().replace(/^["']|["']$/g, "");
         await sendWhatsAppReply({
           phoneNumberId: fallbackPhoneId,
           accessToken: fallbackToken,
@@ -394,6 +400,55 @@ async function handleIncomingWebhookPayload(body, options = {}) {
     }
     return { status: "exception_caught", error: error?.message || error };
   }
+}
+
+async function handleIncomingWebhookPayload(body, options = {}) {
+  const customFetch = options.fetchFn || fetch;
+  const entries = Array.isArray(body?.entry) ? body.entry : body?.entry ? [body.entry] : [];
+
+  if (entries.length === 0 && !body?.type && !body?.text && !body?.messages) {
+    console.warn("[Webhook Warning] Empty webhook payload received with no entries.");
+    return { status: "empty_payload" };
+  }
+
+  let lastResult = { status: "no_messages_or_statuses" };
+
+  for (const entry of entries) {
+    const changes = Array.isArray(entry?.changes) ? entry.changes : entry?.changes ? [entry.changes] : [];
+
+    for (const change of changes) {
+      const value = change?.value;
+      if (!value) continue;
+
+      // 1. Process Messages FIRST
+      const messages = Array.isArray(value.messages) ? value.messages : value.messages ? [value.messages] : [];
+      if (messages.length > 0) {
+        for (const message of messages) {
+          lastResult = await processSingleIncomingMessage(message, value, customFetch);
+        }
+        continue;
+      }
+
+      // 2. Process Status Updates
+      if (value.statuses && value.statuses.length > 0) {
+        const statusObj = value.statuses[0];
+        const statusRecipient = maskPhoneNumber(statusObj.recipient_id || statusObj.wa_id);
+        console.log(`[WhatsApp Status Update] ${statusObj.status?.toUpperCase()} | Recipient: ${statusRecipient}`);
+        if (statusObj.status === "failed" && statusObj.errors) {
+          console.error(`[WhatsApp Status Error]:`, JSON.stringify(sanitizeMetaError(statusObj.errors[0] || statusObj.errors)));
+        }
+        lastResult = { status: "status_update_handled" };
+      }
+    }
+  }
+
+  // Fallback for flat simulated testing payloads (e.g. { type: 'text', text: { body: '...' }, from: '...' })
+  if (lastResult.status === "no_messages_or_statuses" && (body?.type || body?.text || body?.messages)) {
+    const rawMsg = body?.messages?.[0] || body;
+    lastResult = await processSingleIncomingMessage(rawMsg, body, customFetch);
+  }
+
+  return lastResult;
 }
 
 // ============================================================================
