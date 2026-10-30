@@ -31,13 +31,30 @@ const app = express();
  */
 function getEnvSafe(...keys) {
   for (const k of keys) {
+    // 1. Direct standard key lookup
     if (process.env[k] && typeof process.env[k] === "string" && process.env[k].trim()) {
       return process.env[k].trim().replace(/^["']|["']$/g, "");
     }
+    // 2. Case-insensitive exact key lookup
     const lowerKey = k.toLowerCase();
     const match = Object.keys(process.env).find((envKey) => envKey.toLowerCase() === lowerKey);
     if (match && process.env[match] && typeof process.env[match] === "string" && process.env[match].trim()) {
       return process.env[match].trim().replace(/^["']|["']$/g, "");
+    }
+    // 3. Container fallback: handles keys where value was merged with key name (e.g., KEYvalue or KEY=value)
+    const mergedKey = Object.keys(process.env).find((envKey) => {
+      const lower = envKey.toLowerCase();
+      return lower.startsWith(lowerKey) && lower.length > lowerKey.length;
+    });
+    if (mergedKey) {
+      let extracted = mergedKey.slice(k.length);
+      if (extracted.startsWith("=") || extracted.startsWith(":")) {
+        extracted = extracted.slice(1);
+      }
+      extracted = extracted.trim().replace(/^["']|["']$/g, "");
+      if (extracted) {
+        return extracted;
+      }
     }
   }
   return "";
@@ -131,19 +148,10 @@ app.get("/health", (req, res) => {
   const dataGovKey = getEnvSafe("DATA_GOV_IN_API_KEY", "DATA_GOV_KEY", "AGMARKNET_API_KEY", "MANDI_API_KEY");
   const geminiKey = getEnvSafe("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY");
 
-  const systemKeys = new Set([
-    "PATH", "NODE_VERSION", "YARN_VERSION", "HOME", "USER", "HOSTNAME",
-    "PWD", "SHLVL", "_", "NODE_ENV", "PORT", "RENDER", "RENDER_SERVICE_ID",
-    "RENDER_SERVICE_NAME", "RENDER_SERVICE_TYPE", "RENDER_INSTANCE_ID",
-    "RENDER_GIT_COMMIT", "RENDER_GIT_BRANCH", "RENDER_GIT_REPO_SLUG",
-    "IS_PULL_REQUEST"
-  ]);
-  const userConfiguredKeys = Object.keys(process.env).filter(k => !systemKeys.has(k) && !k.startsWith("npm_"));
-
   res.status(200).json({
     status: "ok",
     service: "CropCash Backend",
-    deployedCommit: process.env.RENDER_GIT_COMMIT || "8abb6cd",
+    deployedCommit: process.env.RENDER_GIT_COMMIT || null,
     uptime: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     environment: {
@@ -157,7 +165,6 @@ app.get("/health", (req, res) => {
       verifyTokenLength: verifyToken ? verifyToken.length : 0,
       accessTokenLength: accessToken ? accessToken.length : 0,
       phoneNumberIdLength: phoneNumberId ? phoneNumberId.length : 0,
-      detectedVariableKeys: userConfiguredKeys,
       secretFileExists: {
         backendEnv: fs.existsSync(path.join(__dirname, ".env")),
         rootEnv: fs.existsSync(path.join(__dirname, "..", ".env")),
