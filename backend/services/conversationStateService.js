@@ -32,6 +32,10 @@ function getSession(userId) {
       waitingFor: null,
       lastPromptType: null,
       lastLanguage: "en",
+      selectedLanguage: null,
+      activeFeature: null,
+      step: 0,
+      previousStep: 0,
       history: [],
       createdAt: Date.now(),
       updatedAt: Date.now()

@@ -109,8 +109,8 @@ function verifyMetaSignature(req) {
     }
 
     const isValid = crypto.timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(expectedSignature)
+      Buffer.from(signature.toLowerCase()),
+      Buffer.from(expectedSignature.toLowerCase())
     );
 
     if (!isValid) {
@@ -133,6 +133,15 @@ app.use(
     },
   })
 );
+
+// Gracefully log malformed JSON payloads from webhooks
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    console.error(`[Webhook Body Error] Malformed JSON received: ${err.message}`);
+    return res.status(400).json({ error: "Malformed JSON payload" });
+  }
+  next();
+});
 
 // Home
 app.get("/", (req, res) => {
@@ -277,15 +286,27 @@ async function sendWhatsAppReply({
   apiVersion = "v21.0",
   to,
   replyText,
+  interactive,
   fetchFn = fetch
 }) {
   const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
-  const body = JSON.stringify({
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: replyText }
-  });
+  let requestPayload;
+  if (interactive) {
+    requestPayload = {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive
+    };
+  } else {
+    requestPayload = {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: replyText }
+    };
+  }
+  const body = JSON.stringify(requestPayload);
 
   const headers = {
     Authorization: `Bearer ${accessToken}`,
@@ -417,19 +438,46 @@ async function processSingleIncomingMessage(message, containerValue, customFetch
     }
 
     // Process Message through CropCash AI & Decision Pipeline
-    const { replyText, lang, type, intent } = await processIncomingMessage(message, from);
-    console.log(`[Response Generated] Language: ${lang} | Intent: ${intent || "N/A"} | Length: ${replyText.length} chars`);
+    const { replyText, lang, type, intent, interactive, followUpInteractive } = await processIncomingMessage(message, from);
+    console.log(`[Response Generated] Language: ${lang} | Intent: ${intent || "N/A"} | Length: ${replyText ? replyText.length : 0} chars | Interactive: ${Boolean(interactive || followUpInteractive)}`);
 
     // Send Reply to WhatsApp Cloud API
-    console.log(`[WhatsApp API Request] Dispatching reply to ${maskPhoneNumber(from)} via Phone ID: ${maskIdentifier(phoneNumberId)}...`);
-    const sendResult = await sendWhatsAppReply({
-      phoneNumberId,
-      accessToken,
-      apiVersion,
-      to: from,
-      replyText,
-      fetchFn: customFetch
-    });
+    let sendResult = { ok: true, status: 200, messageId: null };
+
+    if (interactive) {
+      console.log(`[WhatsApp API Request] Dispatching interactive message to ${maskPhoneNumber(from)} via Phone ID: ${maskIdentifier(phoneNumberId)}...`);
+      sendResult = await sendWhatsAppReply({
+        phoneNumberId,
+        accessToken,
+        apiVersion,
+        to: from,
+        interactive,
+        fetchFn: customFetch
+      });
+    } else if (replyText) {
+      console.log(`[WhatsApp API Request] Dispatching reply to ${maskPhoneNumber(from)} via Phone ID: ${maskIdentifier(phoneNumberId)}...`);
+      sendResult = await sendWhatsAppReply({
+        phoneNumberId,
+        accessToken,
+        apiVersion,
+        to: from,
+        replyText,
+        fetchFn: customFetch
+      });
+
+      // Dispatch polite follow-up interactive buttons if present
+      if (sendResult.ok && followUpInteractive) {
+        console.log(`[WhatsApp API Request] Dispatching follow-up interactive buttons to ${maskPhoneNumber(from)}...`);
+        await sendWhatsAppReply({
+          phoneNumberId,
+          accessToken,
+          apiVersion,
+          to: from,
+          interactive: followUpInteractive,
+          fetchFn: customFetch
+        });
+      }
+    }
 
     if (!sendResult.ok) {
       console.error(`[WhatsApp API Error] HTTP ${sendResult.status} ${sendResult.statusText}:`, JSON.stringify(sendResult.error));
@@ -532,6 +580,8 @@ async function handleIncomingWebhookPayload(body, options = {}) {
 // ============================================================================
 app.post("/webhook", async (req, res) => {
   const timestamp = new Date().toISOString();
+  const hasSignature = Boolean(req.headers["x-hub-signature-256"]);
+  console.log(`[Webhook Inbound] Received POST /webhook at ${timestamp} | Has Signature: ${hasSignature}`);
 
   if (!verifyMetaSignature(req)) {
     console.error(`[Webhook Security] Invalid Meta webhook signature at ${timestamp}`);

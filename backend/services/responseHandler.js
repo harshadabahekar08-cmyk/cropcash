@@ -14,13 +14,34 @@ const { getFertilizerAdvisoryResponse } = require("./fertilizerAdvisoryService")
 const { getWeatherAdvisoryResponse } = require("./weatherAdvisoryService");
 const { getCropAdvisoryResponse } = require("./cropAdvisoryService");
 const { getSchemeResponse, identifySchemeTopic } = require("./schemeService");
+const { extractQuantity, extractFarmerVillage } = require("./transportService");
 const {
   resolveContextualEntities,
   getFollowUpResponse,
+  getSession,
+  updateSession,
   resetSession,
   isAffirmation,
   isResetRequest
 } = require("./conversationStateService");
+const {
+  LANGUAGES,
+  GREETING_TEXTS,
+  MENU_TEXTS,
+  AFTER_REQUEST_TEXTS,
+  AFTER_REQUEST_BUTTONS,
+  FEATURE_QUESTIONS,
+  GOODBYE_TEXTS,
+  HELP_TEXTS,
+  getLanguageSelectionInteractive,
+  getMainMenuInteractive,
+  getAfterRequestInteractive,
+  getSchemesInteractive,
+  isGreetingMessage,
+  parseLanguageSelection,
+  parseNavigationControl,
+  parseMainMenuSelection
+} = require("./chatbotFlowService");
 
 // Agricultural Intent Keywords (Categorized)
 const INTENT_KEYWORDS = {
@@ -227,88 +248,541 @@ async function processIncomingMessage(message, overrideUserId = null) {
       replyText: safeReply,
       lang,
       type: "image",
-      intent: "disease"
+      intent: "disease",
+      followUpInteractive: getAfterRequestInteractive(lang)
     };
   }
 
-  // 3. Handle Text Messages
-  if (messageType === "text" || message?.text?.body) {
-    const textBody =
+  // 3. Handle Text & WhatsApp Interactive Messages (Buttons, List Replies)
+  if (messageType === "text" || messageType === "interactive" || message?.text?.body || message?.interactive) {
+    const textBody = (
       message.text?.body ||
       message.interactive?.button_reply?.title ||
       message.interactive?.list_reply?.title ||
       message.button?.text ||
-      "";
+      ""
+    ).trim();
+
+    const buttonId = (
+      message.interactive?.button_reply?.id ||
+      message.interactive?.list_reply?.id ||
+      ""
+    ).trim();
 
     const userId = overrideUserId || message.from || message.userId || "default_user";
+    const session = getSession(userId);
+
+    // Language determination: If user already selected a language, STRICTLY communicate in that language
+    let lang = session.selectedLanguage || detectLanguage(textBody) || session.lastLanguage || "en";
+
+    console.log(`[ResponseHandler] Incoming Text: "${textBody}" | ButtonId: "${buttonId}" | User: ${userId} | Lang: ${lang}`);
+
+    // -------------------------------------------------------------
+    // CHECK 1: LANGUAGE SELECTION
+    // -------------------------------------------------------------
+    const chosenLang = parseLanguageSelection(buttonId || textBody);
+    if (chosenLang) {
+      session.selectedLanguage = chosenLang;
+      session.lastLanguage = chosenLang;
+      session.activeFeature = null;
+      session.step = 0;
+      updateSession(userId, { selectedLanguage: chosenLang, lastLanguage: chosenLang, activeFeature: null, step: 0 });
+
+      const menuInteractive = getMainMenuInteractive(chosenLang);
+      const safeReply = validateAndSanitizeResponse(MENU_TEXTS[chosenLang].body, chosenLang);
+      return {
+        replyText: safeReply,
+        lang: chosenLang,
+        type: "interactive",
+        interactive: menuInteractive,
+        intent: "greeting"
+      };
+    }
+
+    // -------------------------------------------------------------
+    // CHECK 2: NAVIGATION CONTROLS (Main Menu, Back, Change Language, Start Again, Help, End Conversation)
+    // -------------------------------------------------------------
+    const navControl = parseNavigationControl(buttonId || textBody);
+    if (navControl) {
+      if (navControl === "main_menu" || navControl === "ask_another") {
+        session.activeFeature = null;
+        session.step = 0;
+        updateSession(userId, { activeFeature: null, step: 0 });
+        const menuInteractive = getMainMenuInteractive(lang);
+        const safeReply = validateAndSanitizeResponse(MENU_TEXTS[lang].body, lang);
+        return {
+          replyText: safeReply,
+          lang,
+          type: "interactive",
+          interactive: menuInteractive,
+          intent: "greeting"
+        };
+      }
+
+      if (navControl === "change_language") {
+        const langInteractive = getLanguageSelectionInteractive(lang);
+        const prompt = GREETING_TEXTS[lang] || GREETING_TEXTS.en;
+        return {
+          replyText: validateAndSanitizeResponse(prompt, lang),
+          lang,
+          type: "interactive",
+          interactive: langInteractive,
+          intent: "greeting"
+        };
+      }
+
+      if (navControl === "start_again") {
+        resetSession(userId);
+        const langInteractive = getLanguageSelectionInteractive("en");
+        return {
+          replyText: validateAndSanitizeResponse(GREETING_TEXTS.en, "en"),
+          lang: "en",
+          type: "interactive",
+          interactive: langInteractive,
+          intent: "greeting"
+        };
+      }
+
+      if (navControl === "help") {
+        const helpText = HELP_TEXTS[lang] || HELP_TEXTS.en;
+        return {
+          replyText: validateAndSanitizeResponse(helpText, lang),
+          lang,
+          type: "text",
+          intent: "help",
+          followUpInteractive: getMainMenuInteractive(lang)
+        };
+      }
+
+      if (navControl === "end_chat") {
+        session.activeFeature = null;
+        session.step = 0;
+        updateSession(userId, { activeFeature: null, step: 0 });
+        const byeText = GOODBYE_TEXTS[lang] || GOODBYE_TEXTS.en;
+        return {
+          replyText: validateAndSanitizeResponse(byeText, lang),
+          lang,
+          type: "text",
+          intent: "end"
+        };
+      }
+
+      if (navControl === "back") {
+        if (session.activeFeature && session.step > 1) {
+          session.step -= 1;
+          const feat = session.activeFeature;
+          let questionText = "";
+          if (feat === "best_mandi" || feat === "transport") {
+            if (session.step === 1) questionText = FEATURE_QUESTIONS[feat].ask_crop[lang];
+            if (session.step === 2) questionText = FEATURE_QUESTIONS[feat].ask_quantity[lang];
+          } else if (feat === "mandi_prices") {
+            if (session.step === 1) questionText = FEATURE_QUESTIONS.mandi_prices.ask_crop[lang];
+          }
+          return {
+            replyText: validateAndSanitizeResponse(questionText, lang),
+            lang,
+            type: "text"
+          };
+        } else {
+          session.activeFeature = null;
+          session.step = 0;
+          updateSession(userId, { activeFeature: null, step: 0 });
+          return {
+            replyText: validateAndSanitizeResponse(MENU_TEXTS[lang].body, lang),
+            lang,
+            type: "interactive",
+            interactive: getMainMenuInteractive(lang),
+            intent: "greeting"
+          };
+        }
+      }
+    }
+
+    // -------------------------------------------------------------
+    // CHECK 3: GREETING (Hi / Hello / Namaste)
+    // -------------------------------------------------------------
+    if (isGreetingMessage(textBody)) {
+      const prompt = GREETING_TEXTS[lang] || GREETING_TEXTS.en;
+      const langInteractive = getLanguageSelectionInteractive(lang);
+      return {
+        replyText: validateAndSanitizeResponse(prompt, lang),
+        lang,
+        type: "interactive",
+        interactive: langInteractive,
+        intent: "greeting"
+      };
+    }
+
+    // -------------------------------------------------------------
+    // CHECK 4: MAIN INTERACTIVE MENU SELECTIONS
+    // -------------------------------------------------------------
+    const menuSelection = parseMainMenuSelection(buttonId || textBody);
+    if (menuSelection) {
+      if (menuSelection === "best_mandi") {
+        session.activeFeature = "best_mandi";
+        session.step = 1;
+        session.crop = null;
+        session.quantity = null;
+        session.village = null;
+        session.district = null;
+        updateSession(userId, { activeFeature: "best_mandi", step: 1, crop: null, quantity: null, village: null, district: null });
+        return {
+          replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.best_mandi.ask_crop[lang], lang),
+          lang,
+          type: "text",
+          intent: "transport_decision"
+        };
+      }
+
+      if (menuSelection === "mandi_prices") {
+        session.activeFeature = "mandi_prices";
+        session.step = 1;
+        session.crop = null;
+        session.district = null;
+        session.village = null;
+        updateSession(userId, { activeFeature: "mandi_prices", step: 1, crop: null, district: null, village: null });
+        return {
+          replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.mandi_prices.ask_crop[lang], lang),
+          lang,
+          type: "text",
+          intent: "price"
+        };
+      }
+
+      if (menuSelection === "transport") {
+        session.activeFeature = "transport";
+        session.step = 1;
+        session.crop = null;
+        session.quantity = null;
+        session.village = null;
+        session.district = null;
+        updateSession(userId, { activeFeature: "transport", step: 1, crop: null, quantity: null, village: null, district: null });
+        return {
+          replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.transport.ask_crop[lang], lang),
+          lang,
+          type: "text",
+          intent: "transport_decision"
+        };
+      }
+
+      if (menuSelection === "schemes") {
+        session.activeFeature = "schemes";
+        updateSession(userId, { activeFeature: "schemes" });
+        const schemeOverview = getSchemeResponse(textBody || "government schemes", lang);
+        return {
+          replyText: validateAndSanitizeResponse(schemeOverview, lang),
+          lang,
+          type: "interactive",
+          interactive: getSchemesInteractive(lang),
+          intent: "scheme",
+          followUpInteractive: getAfterRequestInteractive(lang)
+        };
+      }
+
+      if (menuSelection === "trend") {
+        session.activeFeature = "trend";
+        session.step = 1;
+        updateSession(userId, { activeFeature: "trend", step: 1 });
+        return {
+          replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.trend.ask_crop[lang], lang),
+          lang,
+          type: "text",
+          intent: "trend"
+        };
+      }
+    }
+
+    // -------------------------------------------------------------
+    // CHECK 5: ACTIVE FEATURE STEP-BY-STEP CONVERSATION FLOW
+    // -------------------------------------------------------------
+    if (session.activeFeature) {
+      const feat = session.activeFeature;
+
+      // === FEATURE: FIND BEST MANDI or CALCULATE TRANSPORT ===
+      if (feat === "best_mandi" || feat === "transport") {
+        const { crop: directCrop } = extractMandiEntities(textBody);
+        const directQty = extractQuantity(textBody);
+        const directVillage = extractFarmerVillage(textBody);
+        const { district: directDistrict } = extractMandiEntities(textBody);
+
+        // Turn 1: Asking for crop
+        if (session.step === 1) {
+          if (directCrop) session.crop = directCrop;
+          if (directQty !== null) session.quantity = directQty;
+          if (directVillage || directDistrict) {
+            session.village = directVillage || { standardName: directDistrict, key: directDistrict.toLowerCase() };
+            session.district = directDistrict || session.village?.standardName;
+          }
+
+          if (session.crop && session.quantity !== null && (session.village || session.district)) {
+            session.activeFeature = null;
+            session.step = 0;
+            const resText = await getMandiDecisionResponse(textBody, lang, undefined, {
+              crop: session.crop,
+              quantity: session.quantity,
+              village: session.village,
+              district: session.district
+            });
+            return {
+              replyText: validateAndSanitizeResponse(resText, lang),
+              lang,
+              type: "text",
+              intent: "transport_decision",
+              followUpInteractive: getAfterRequestInteractive(lang)
+            };
+          }
+
+          if (session.crop) {
+            session.step = 2;
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS[feat].ask_quantity[lang], lang),
+              lang,
+              type: "text"
+            };
+          } else {
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS[feat].ask_crop[lang], lang),
+              lang,
+              type: "text"
+            };
+          }
+        }
+
+        // Turn 2: Asking for quantity
+        if (session.step === 2) {
+          if (directQty !== null) session.quantity = directQty;
+          if (directVillage || directDistrict) {
+            session.village = directVillage || { standardName: directDistrict, key: directDistrict.toLowerCase() };
+            session.district = directDistrict || session.village?.standardName;
+          }
+
+          if (session.quantity !== null && (session.village || session.district)) {
+            session.activeFeature = null;
+            session.step = 0;
+            const resText = await getMandiDecisionResponse(textBody, lang, undefined, {
+              crop: session.crop,
+              quantity: session.quantity,
+              village: session.village,
+              district: session.district
+            });
+            return {
+              replyText: validateAndSanitizeResponse(resText, lang),
+              lang,
+              type: "text",
+              intent: "transport_decision",
+              followUpInteractive: getAfterRequestInteractive(lang)
+            };
+          }
+
+          if (session.quantity !== null) {
+            session.step = 3;
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS[feat].ask_location[lang], lang),
+              lang,
+              type: "text"
+            };
+          } else {
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS[feat].ask_quantity[lang], lang),
+              lang,
+              type: "text"
+            };
+          }
+        }
+
+        // Turn 3: Asking for location
+        if (session.step === 3) {
+          const villageObj = directVillage || (directDistrict ? { standardName: directDistrict, key: directDistrict.toLowerCase() } : null) || { standardName: textBody, key: textBody.toLowerCase() };
+          session.village = villageObj;
+          session.district = directDistrict || villageObj.standardName;
+          session.activeFeature = null;
+          session.step = 0;
+
+          const resText = await getMandiDecisionResponse(textBody, lang, undefined, {
+            crop: session.crop,
+            quantity: session.quantity,
+            village: session.village,
+            district: session.district
+          });
+
+          return {
+            replyText: validateAndSanitizeResponse(resText, lang),
+            lang,
+            type: "text",
+            intent: "transport_decision",
+            followUpInteractive: getAfterRequestInteractive(lang)
+          };
+        }
+      }
+
+      // === FEATURE: CHECK MANDI PRICES ===
+      if (feat === "mandi_prices") {
+        const { crop: directCrop, district: directDistrict } = extractMandiEntities(textBody);
+
+        if (session.step === 1) {
+          if (directCrop) session.crop = directCrop;
+          if (directDistrict) session.district = directDistrict;
+
+          if (session.crop && session.district) {
+            session.activeFeature = null;
+            session.step = 0;
+            const resText = await getMandiPriceResponse(textBody, lang, undefined, {
+              crop: session.crop,
+              district: session.district
+            });
+            return {
+              replyText: validateAndSanitizeResponse(resText, lang),
+              lang,
+              type: "text",
+              intent: "price",
+              followUpInteractive: getAfterRequestInteractive(lang)
+            };
+          }
+
+          if (session.crop) {
+            session.step = 2;
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.mandi_prices.ask_location[lang], lang),
+              lang,
+              type: "text"
+            };
+          } else {
+            return {
+              replyText: validateAndSanitizeResponse(FEATURE_QUESTIONS.mandi_prices.ask_crop[lang], lang),
+              lang,
+              type: "text"
+            };
+          }
+        }
+
+        if (session.step === 2) {
+          session.district = directDistrict || textBody;
+          session.activeFeature = null;
+          session.step = 0;
+          const resText = await getMandiPriceResponse(textBody, lang, undefined, {
+            crop: session.crop,
+            district: session.district
+          });
+          return {
+            replyText: validateAndSanitizeResponse(resText, lang),
+            lang,
+            type: "text",
+            intent: "price",
+            followUpInteractive: getAfterRequestInteractive(lang)
+          };
+        }
+      }
+
+      // === FEATURE: GOVERNMENT SCHEMES ===
+      if (feat === "schemes") {
+        session.activeFeature = null;
+        session.step = 0;
+        const schemeReply = getSchemeResponse(textBody, lang);
+        return {
+          replyText: validateAndSanitizeResponse(schemeReply, lang),
+          lang,
+          type: "text",
+          intent: "scheme",
+          followUpInteractive: getAfterRequestInteractive(lang)
+        };
+      }
+
+      // === FEATURE: CROP PRICE TREND ===
+      if (feat === "trend") {
+        session.activeFeature = null;
+        session.step = 0;
+        const trendReply = RESPONSES.trend[lang] || RESPONSES.trend.en;
+        return {
+          replyText: validateAndSanitizeResponse(trendReply, lang),
+          lang,
+          type: "text",
+          intent: "trend",
+          followUpInteractive: getAfterRequestInteractive(lang)
+        };
+      }
+    }
+
+    // -------------------------------------------------------------
+    // CHECK 6: NATURAL LANGUAGE DOMAIN ROUTING
+    // -------------------------------------------------------------
     const context = resolveContextualEntities(userId, textBody);
-    const lang = detectLanguage(textBody);
     const intent = detectIntent(textBody, context);
 
-    console.log(`[ResponseHandler] Incoming Text: "${textBody}" | User: ${userId} | Lang: ${lang} | Intent: ${intent}`);
-
     let rawReply = "";
+    let followUpInteractive = undefined;
 
     // A. If Reset Request
     if (context.isReset) {
       resetSession(userId);
-      const templateGroup = RESPONSES.greeting;
-      rawReply = templateGroup[lang] || templateGroup.en || RESPONSES.greeting.en;
+      const langInteractive = getLanguageSelectionInteractive(lang);
+      return {
+        replyText: validateAndSanitizeResponse(GREETING_TEXTS[lang], lang),
+        lang,
+        type: "interactive",
+        interactive: langInteractive,
+        intent: "greeting"
+      };
     }
     // B. If Affirmation ("Haan", "Yes", "Ho", etc.)
     else if (intent === "affirmation") {
-      console.log("[ResponseHandler] Routing to Affirmation Follow-Up Handler");
       rawReply = getFollowUpResponse(context.session, textBody, lang);
+      followUpInteractive = getAfterRequestInteractive(lang);
     }
     // C. If intent is Transport / Mandi Net-Return Decision
     else if (intent === "transport_decision") {
-      console.log("[ResponseHandler] Routing to Mandi Decision Service");
       rawReply = await getMandiDecisionResponse(textBody, lang, undefined, {
         crop: context.mergedCrop,
         quantity: context.mergedQuantity,
         village: context.mergedVillage,
         district: context.mergedDistrict
       });
+      const isComplete = Boolean(context.mergedCrop && context.mergedQuantity !== null && (context.mergedVillage || context.mergedDistrict));
+      if (isComplete) {
+        followUpInteractive = getAfterRequestInteractive(lang);
+      }
     }
     // D. If intent is Government Scheme Information
     else if (intent === "scheme") {
-      console.log("[ResponseHandler] Routing to Scheme Service");
       rawReply = getSchemeResponse(textBody, lang);
       const topic = identifySchemeTopic(textBody);
       context.session.lastSubTopic = topic;
+      followUpInteractive = getAfterRequestInteractive(lang);
     }
     // E. If intent is Fertilizer & Nutrient Advisory
     else if (intent === "fertilizer") {
-      console.log("[ResponseHandler] Routing to Fertilizer Advisory Service");
       rawReply = await getFertilizerAdvisoryResponse(textBody, lang, undefined, {
         crop: context.mergedCrop
       });
+      followUpInteractive = getAfterRequestInteractive(lang);
     }
     // F. If intent is Mandi Price
     else if (intent === "price") {
-      console.log("[ResponseHandler] Routing to Mandi Price Service");
       rawReply = await getMandiPriceResponse(textBody, lang, undefined, {
         crop: context.mergedCrop,
         district: context.mergedDistrict
       });
+      const isComplete = Boolean(context.mergedCrop && context.mergedDistrict);
+      if (isComplete) {
+        followUpInteractive = getAfterRequestInteractive(lang);
+      }
     }
     // G. If intent is Agromet Weather Advisory
     else if (intent === "weather") {
-      console.log("[ResponseHandler] Routing to Weather Advisory Service");
       rawReply = await getWeatherAdvisoryResponse(textBody, lang, undefined, {
         location: context.mergedVillage?.standardName || context.mergedDistrict
       });
+      followUpInteractive = getAfterRequestInteractive(lang);
     }
     // H. If intent is Crop Cultivation / PDKV PoP Advisory
     else if (intent === "cultivation") {
-      console.log("[ResponseHandler] Routing to Crop Advisory Service");
       rawReply = await getCropAdvisoryResponse(textBody, lang, {
         crop: context.mergedCrop
       });
+      followUpInteractive = getAfterRequestInteractive(lang);
     } else {
-      console.log(`[ResponseHandler] Routing to default template: ${intent}`);
       const templateGroup = RESPONSES[intent] || RESPONSES.general;
       rawReply = templateGroup[lang] || templateGroup.en || RESPONSES.general.en;
+      followUpInteractive = getMainMenuInteractive(lang);
     }
 
     // Update session tracking state
@@ -326,17 +800,16 @@ async function processIncomingMessage(message, overrideUserId = null) {
       replyText: safeReply,
       lang,
       type: "text",
-      intent
+      intent,
+      followUpInteractive
     };
   }
 
   // 4. Fallback for other payload types
   const lang = "en";
   const fallbackText = "🌾 *CropCash Support*\n\nWe received your message. You can send us text queries in English, Hindi, Marathi, or Hinglish, or send photos of your crops and voice notes!";
-  const safeReply = validateAndSanitizeResponse(fallbackText, lang);
-
   return {
-    replyText: safeReply,
+    replyText: validateAndSanitizeResponse(fallbackText, lang),
     lang,
     type: messageType
   };
