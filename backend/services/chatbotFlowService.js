@@ -347,7 +347,15 @@ function isGreetingMessage(text) {
     "namaste", "namaskar", "namaskaram", "pranam", "ram ram", "radhe radhe",
     "नमस्ते", "नमस्कार", "राम राम", "प्रणाम", "जय श्री राम"
   ];
-  return greetings.includes(clean);
+  if (greetings.includes(clean)) return true;
+  if (
+    clean.includes("explore your farming assistance") ||
+    clean.startsWith("hello cropcash") ||
+    clean.startsWith("hi cropcash")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**

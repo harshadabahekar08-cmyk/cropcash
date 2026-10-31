@@ -21,6 +21,12 @@ const path = require("path");
 
 const { processIncomingMessage } = require("./services/responseHandler");
 const { isValidIncomingMessage } = require("./services/safetyValidator");
+const {
+  renderDemoPageHTML,
+  generateQRCodeBuffer,
+  generateQRCodeSVG,
+  getWhatsAppPublicConfig
+} = require("./services/demoService");
 
 const app = express();
 
@@ -145,7 +151,58 @@ app.use((err, req, res, next) => {
 
 // Home
 app.get("/", (req, res) => {
-  res.send("CropCash Backend is running!");
+  if (req.headers.accept && req.headers.accept.includes("text/html")) {
+    return res.redirect("/demo");
+  }
+  res.send("CropCash Backend is running! Visit /demo for WhatsApp Chatbot demo portal & QR code.");
+});
+
+// Public Demo Access Portal
+app.get("/demo", async (req, res) => {
+  try {
+    const html = await renderDemoPageHTML();
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(html);
+  } catch (err) {
+    console.error("Error rendering demo page:", err);
+    res.status(500).send("Error rendering demo page");
+  }
+});
+
+// Dynamic QR Code Generator endpoint (PNG or SVG)
+app.get("/api/qr", async (req, res) => {
+  try {
+    const format = (req.query.format || "png").toLowerCase();
+    const download = req.query.download === "true";
+
+    if (download) {
+      res.setHeader("Content-Disposition", 'attachment; filename="cropcash_whatsapp_qr.png"');
+    }
+
+    if (format === "svg") {
+      const svg = await generateQRCodeSVG();
+      res.setHeader("Content-Type", "image/svg+xml");
+      return res.send(svg);
+    } else {
+      const size = Math.min(Math.max(Number(req.query.size) || 600, 200), 1200);
+      const buffer = await generateQRCodeBuffer(size);
+      res.setHeader("Content-Type", "image/png");
+      return res.send(buffer);
+    }
+  } catch (err) {
+    console.error("Error generating QR code:", err);
+    res.status(500).send("Error generating QR code");
+  }
+});
+
+// WhatsApp Link & Configuration details API
+app.get("/api/chat-link", (req, res) => {
+  try {
+    const config = getWhatsAppPublicConfig();
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to resolve WhatsApp link" });
+  }
 });
 
 // Health check endpoint
